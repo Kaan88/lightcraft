@@ -2427,4 +2427,3 @@ fn vrr_flicker_workaround_setting_toggles_and_persists() {
     let deserialized: crate::state::AppSettings = serde_json::from_str(&serialized).unwrap();
     assert!(deserialized.vrr_flicker_workaround);
 }
-
