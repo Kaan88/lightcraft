@@ -2424,29 +2424,35 @@ fn vrr_repaint_depends_on_setting_and_focus() {
 
 #[cfg(target_os = "windows")]
 #[test]
-fn vrr_end_frame_requests_repaint_when_enabled_and_focused() {
+fn vrr_end_frame_requests_repaint_only_when_enabled_and_focused() {
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
 
-    let mut app = LightcraftApp::new(lightcraft_engine::Session::new(), Services::default());
-    app.ui.settings.vrr_flicker_workaround = true;
-    app.headless_host = false;
-    let ctx = egui::Context::default();
-    let mut input = egui::RawInput { focused: true, ..Default::default() };
-    input.viewports.entry(egui::ViewportId::ROOT).or_default().minimized = Some(false);
-    // Drain egui's startup repaints before observing the request from end_frame.
-    for _ in 0..3 {
-        ctx.run_ui(input.clone(), |_| {}).textures_delta.clear();
-    }
-    let requested = Arc::new(AtomicBool::new(false));
-    let seen = Arc::clone(&requested);
-    ctx.set_request_repaint_callback(move |_| {
-        seen.store(true, Ordering::SeqCst);
-    });
+    let end_frame_requests_repaint = |enabled: bool, focused: bool| {
+        let mut app = LightcraftApp::new(lightcraft_engine::Session::new(), Services::default());
+        app.ui.settings.vrr_flicker_workaround = enabled;
+        app.headless_host = false;
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput { focused, ..Default::default() };
+        input.viewports.entry(egui::ViewportId::ROOT).or_default().minimized = Some(false);
+        // Drain egui's startup repaints before observing the request from end_frame.
+        for _ in 0..3 {
+            ctx.run_ui(input.clone(), |_| {}).textures_delta.clear();
+        }
+        let requested = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&requested);
+        ctx.set_request_repaint_callback(move |_| {
+            seen.store(true, Ordering::SeqCst);
+        });
 
-    app.end_frame(&ctx, 0.0);
+        app.end_frame(&ctx, 0.0);
 
-    assert!(requested.load(Ordering::SeqCst), "end_frame must request a repaint for the VRR workaround");
+        requested.load(Ordering::SeqCst)
+    };
+
+    assert!(end_frame_requests_repaint(true, true), "enabled and focused must repaint");
+    assert!(!end_frame_requests_repaint(false, true), "disabled must not repaint");
+    assert!(!end_frame_requests_repaint(true, false), "unfocused must not repaint");
 }
