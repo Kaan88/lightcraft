@@ -2421,3 +2421,32 @@ fn vrr_repaint_depends_on_setting_and_focus() {
     assert!(!wanted(true, true, true, false), "headless host: never repaints");
     assert!(!crate::state::AppSettings::default().vrr_flicker_workaround, "default is off");
 }
+
+#[cfg(target_os = "windows")]
+#[test]
+fn vrr_end_frame_requests_repaint_when_enabled_and_focused() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let mut app = LightcraftApp::new(lightcraft_engine::Session::new(), Services::default());
+    app.ui.settings.vrr_flicker_workaround = true;
+    app.headless_host = false;
+    let ctx = egui::Context::default();
+    let mut input = egui::RawInput { focused: true, ..Default::default() };
+    input.viewports.entry(egui::ViewportId::ROOT).or_default().minimized = Some(false);
+    // Drain egui's startup repaints before observing the request from end_frame.
+    for _ in 0..3 {
+        ctx.run_ui(input.clone(), |_| {}).textures_delta.clear();
+    }
+    let requested = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&requested);
+    ctx.set_request_repaint_callback(move |_| {
+        seen.store(true, Ordering::SeqCst);
+    });
+
+    app.end_frame(&ctx, 0.0);
+
+    assert!(requested.load(Ordering::SeqCst), "end_frame must request a repaint for the VRR workaround");
+}
