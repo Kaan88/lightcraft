@@ -1395,14 +1395,13 @@ impl LightcraftApp {
         self.perf.max_update_ms = self.perf.max_update_ms.max(self.perf.update_ms);
         // Windows only: G-SYNC / FreeSync brightness flicker workaround.
         #[cfg(target_os = "windows")]
-        if self.ui.settings.vrr_flicker_workaround && !self.headless_host {
-            let active = ctx.input(|i| {
-                let focused = i.focused;
+        {
+            let (focused, minimized) = ctx.input(|i| {
                 let minimized =
                     i.viewport().minimized.unwrap_or(false) || i.raw.viewports.get(&i.raw.viewport_id).and_then(|v| v.minimized).unwrap_or(false);
-                focused && !minimized
+                (i.focused, minimized)
             });
-            if active {
+            if vrr_repaint_wanted(self.ui.settings.vrr_flicker_workaround, self.headless_host, focused, minimized) {
                 ctx.request_repaint();
             }
         }
@@ -1528,6 +1527,14 @@ pub struct HoverPreview {
 
 pub fn is_bw(d: &lightcraft_develop::DevelopSettings) -> bool {
     d.treatment == lightcraft_develop::Treatment::Bw || d.profile.id == "lc.mono" || d.profile.id.starts_with("lc.bw.")
+}
+
+/// Whether the VRR flicker workaround should request another repaint this frame: the setting is
+/// on, the host is not headless, and the window is focused and not minimized. Not Windows-gated,
+/// so the decision is testable on every platform; only its call site in `end_frame` is.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn vrr_repaint_wanted(enabled: bool, headless: bool, focused: bool, minimized: bool) -> bool {
+    enabled && !headless && focused && !minimized
 }
 
 /// "Found 3 faces in 2 photos" for a `faces.detect` result.
