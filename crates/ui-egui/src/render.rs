@@ -31,6 +31,14 @@ fn keep_waveform(slot: Slot, h: lcc_raster::Histogram) -> lcc_raster::Histogram 
     if matches!(slot, Slot::Main | Slot::Preview) { h } else { h.without_waveform() }
 }
 
+/// Finished jobs of one kind of slot ([`Renderer::slot_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SlotStats {
+    pub done: u64,
+    /// The last one's time (ms), including its wait in the queue.
+    pub last_ms: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Slot {
     Thumb(PhotoId),
@@ -416,6 +424,9 @@ pub struct Renderer {
     pub completed: u64,
     /// Finished jobs thrown away because a newer request for their slot had replaced them.
     pub discarded: u64,
+    /// Jobs finished since start and the last one's time, by [`Slot::kind`] (`ui.inspect` → `perf.slots`): a drag's
+    /// rate of HDR view renders, tiles or windows, which `completed` mixes with everything else.
+    pub slot_stats: std::collections::BTreeMap<&'static str, SlotStats>,
     /// Keep a CPU copy of every texture so the UI can be rasterized headlessly (set when the app
     /// is driven by the control channel).
     pub keep_pixels: bool,
@@ -474,6 +485,30 @@ pub struct Renderer {
 const IDLE_TRIM: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Slot {
+    /// The kind of slot, without its photo, pane or index (`ui.inspect` → `perf.slots` counts by kind).
+    pub fn kind(self) -> &'static str {
+        match self {
+            Slot::Thumb(_) => "thumb",
+            Slot::ThumbQuick(_) => "thumbQuick",
+            Slot::Main => "main",
+            Slot::Window(_) => "window",
+            Slot::Preview => "preview",
+            Slot::Before => "before",
+            Slot::Compare(_) => "compare",
+            Slot::Prefetch(_) => "prefetch",
+            Slot::Variant(_) => "variant",
+            Slot::Hover => "hover",
+            Slot::Import(_) => "import",
+            Slot::Second => "second",
+            Slot::Tile { .. } => "tile",
+            Slot::Slide(_) => "slide",
+            Slot::SlidePreview => "slidePreview",
+            Slot::HdrHistogram => "hdrHistogram",
+            Slot::PanelHistogram => "panelHistogram",
+            Slot::HdrView(_) => "hdrView",
+        }
+    }
+
     /// An interactive view of the open photo: slider drags redo only the stages they feed, and a
     /// draft that finishes late still replaces older pixels.
     pub fn is_view(self) -> bool {
@@ -523,6 +558,7 @@ impl Renderer {
             last_main_ms: 0.0,
             completed: 0,
             discarded: 0,
+            slot_stats: Default::default(),
             keep_pixels: false,
             stages: HashMap::new(),
             tiles: Default::default(),
@@ -1362,6 +1398,9 @@ impl Renderer {
         let mut changed = false;
         for (mut slot, mut r, mut color, texels, ms) in finished {
             self.completed += 1;
+            let stats = self.slot_stats.entry(slot.kind()).or_default();
+            stats.done += 1;
+            stats.last_ms = ms;
             // made for another display profile than the one in use: obsolete
             if r.display.is_some_and(|id| Some(id) != self.display_id()) {
                 continue;

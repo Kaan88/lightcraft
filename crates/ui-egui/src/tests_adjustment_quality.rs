@@ -263,6 +263,22 @@ fn adjust_quality(h: &mut Headless) -> String {
     reply["result"]["perf"]["adjustQuality"].as_str().unwrap_or_default().to_string()
 }
 
+// `ui.inspect` counts finished renders by kind of slot, so a drag's rate of loupe renders can be told apart from
+// the thumbnails and prefetches that finish beside it
+#[test]
+fn inspect_counts_finished_renders_by_kind_of_slot() {
+    let (mut h, _work) = detail([1024, 768], 1.0);
+    let slots = |h: &mut Headless| h.request("ui.inspect", json!({}), TIMEOUT)["result"]["perf"]["slots"].clone();
+    let before = slots(&mut h);
+    let main = before["main"]["done"].as_u64().expect("the loupe's render is counted");
+    assert!(main >= 1 && before["main"]["lastMs"].is_number());
+    let total: u64 = before.as_object().expect("a map by kind").values().filter_map(|s| s["done"].as_u64()).sum();
+    assert_eq!(total, h.app.renderer.completed, "every finished job is counted once");
+    h.app.session.execute("develop.set", &json!({"values": {"light.exposure": 0.4}})).unwrap();
+    assert!(h.settle(TIMEOUT));
+    assert!(slots(&mut h)["main"]["done"].as_u64() > Some(main), "an edit's render is counted");
+}
+
 // Given high quality adjustment previews on a machine too slow for them (every update takes
 // 400 ms), a drag falls back: drafts while the slider moves, the settled render as soon as it
 // holds still with the mouse still down, and the next drag of that slider starts drafting

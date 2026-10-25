@@ -10,7 +10,8 @@ build is a path to the desktop binary. The probes, all on raw files in the Detai
 
 - `drag`: in SDR, HDR and HDR-on-SDR editing, with high-quality adjustment previews off and on: single exposure
   updates (time until the loupe is quiet again, and until the first render lands) and a 2 s exposure drag at
-  60 Hz (completed renders per second, render time, UI update time, release to quiet).
+  60 Hz (renders finished per second, all slots and the shown view's own (`perf.slots`), render time, UI update
+  time, release to quiet).
 - `step`: arrow keys through the files after a 1.5 s look at each: time until the next photo shows its own final
   render, and what showed first.
 - `release`: at 1:1, a 0.5 s exposure drag to a value no earlier drag ended on, then let go: time until no visible
@@ -137,7 +138,11 @@ def probe_drag(c, files):
                 wait_quiet(c)
                 yield {"file": name, "mode": mode, "hq": hq, "updateMs": statistics.median(lat), "firstMs": statistics.median(first) if first else None}
                 c.ex("develop.beginInteraction", {"label": "Exposure"})
-                done0 = c.inspect()["perf"]["rendersDone"]
+                # the renders that show the drag: the HDR texture's in HDR shown in HDR, else the loupe's
+                kind = "hdrView" if mode == "hdr" else "main"
+                perf0 = c.inspect()["perf"]
+                done0 = perf0["rendersDone"]
+                shown0 = (perf0.get("slots") or {}).get(kind, {}).get("done")
                 t0 = time.perf_counter()
                 ren, ui = [], []
                 for k, v in enumerate(sweep(0.0, 1.5)):
@@ -149,13 +154,16 @@ def probe_drag(c, files):
                         ren.append(p["lastRenderMs"])
                         ui.append(p["updateMs"])
                 secs = time.perf_counter() - t0
-                done = c.inspect()["perf"]["rendersDone"] - done0
+                perf1 = c.inspect()["perf"]
+                done = perf1["rendersDone"] - done0
+                shown1 = (perf1.get("slots") or {}).get(kind, {}).get("done")
                 c.ex("develop.endInteraction", {})
                 yield {
                     "file": name,
                     "mode": mode,
                     "hq": hq,
                     "dragUpdatesPerS": done / secs,
+                    "dragShownPerS": (shown1 - (shown0 or 0)) / secs if shown1 is not None else None,
                     "dragRenderMs": statistics.median(ren),
                     "dragUiMsMax": max(ui),
                     "releaseToQuietMs": wait_quiet(c),
