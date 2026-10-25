@@ -13,6 +13,10 @@ explicit unsupported error and retain the usual embedded-preview fallback.
   [oxideav-jpegxs 0.0.8](https://github.com/OxideAV/oxideav-jpegxs/tree/v0.0.8)
   entropy, one-dimensional 5/3 wavelet and Star-Tetrix primitives. Default features are off;
   this dependency adds no C/C++, FFI, codec subprocess or runtime library.
+- The inverse Star-Tetrix is our own row-parallel version of ISO/IEC 21122-1 Annex F for the
+  profile's parameters (`Ct = 0`, `Cf = 0`, `e1 = e2 = 0`), tested bit-exact against the crate's.
+  Slices (each resets the vertical prediction) and the four components' wavelets are decoded in
+  parallel: a Z f HE file decodes in ~0.13 s instead of ~1 s, with the same samples.
 - The band/packet layout, half-resolution component grids, slice predictor reset and
   horizontal-before-vertical inverse lifting were established from file headers and numerical
   comparisons. Nikon's CDT adds a decomposition byte per component; component 2 bypasses the

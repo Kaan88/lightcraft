@@ -193,41 +193,61 @@ pub(super) fn decode(bytes: &[u8], width: usize, height: usize, bits: u32) -> Re
         return Err(corrupt("insufficient data for the declared dimensions"));
     }
     let (geom, packets) = geometry(w, &header.weights);
-    let mut gathered: Vec<Vec<i32>> = geom.bands.iter().map(|b| Vec::with_capacity(b.wpb as usize * b.l1 as usize * (h / 2))).collect();
-    let mut top = PrecinctTop::default();
+    // The precincts and their entropy-coded bodies, in order. Slices are independent (each resets the vertical
+    // prediction), so they are decoded in parallel below.
+    let mut precincts = Vec::with_capacity(h / 2);
     for precinct in 0..h / 2 {
         if precinct % header.slice_height == 0 {
             let slice = reader.marker([0xff, 0x20])?;
             if slice != ((precinct / header.slice_height) as u16).to_be_bytes() {
                 return Err(corrupt("invalid slice index"));
             }
-            // Vertical GCLI prediction is signalled even at Nikon slice starts. Its external
-            // predecessor is zero; the second row of component 2 still predicts within the precinct.
-            top = PrecinctTop::default();
         }
         let ph = entropy::parse_precinct_header(reader.rest, &geom).map_err(corrupt)?;
         reader.take(ph.header_bytes)?;
-        let mut body = Reader { rest: reader.take(ph.lprc as usize)? };
-        let mut state = PrecinctState::default();
-        for layout in &packets {
-            let packet = entropy::parse_packet_header(body.rest, &geom).map_err(corrupt)?;
-            body.take(packet.header_bytes)?;
-            let decoded = entropy::decode_packet_body(body.rest, &geom, &ph, &packet, layout, &mut state, Some(&top)).map_err(corrupt)?;
-            body.take(decoded.bytes_consumed)?;
-        }
-        // Lprc includes encoder padding (not necessarily zero), which is not another packet.
-        let dequantized = oxideav_jpegxs::dequant::dequantize_precinct(1, &geom, &entropy::precinct_truncation(&geom, &ph), &state.coefficients, 4);
-        for (dst, src) in gathered.iter_mut().zip(dequantized) {
-            dst.extend(src);
-        }
-        top = PrecinctTop::capture(&geom, &ph, &state);
+        let body = reader.take(ph.lprc as usize)?;
+        precincts.push((ph, body));
     }
     if reader.take(2)? != [0xff, 0x11] || !reader.rest.is_empty() {
         return Err(corrupt("missing end marker or unexpected trailing data"));
     }
-    let mut planes: [Vec<i32>; 4] = std::array::from_fn(|_| Vec::new());
+    use rayon::prelude::*;
+    let slices: Vec<Vec<Vec<i32>>> = precincts
+        .par_chunks(header.slice_height)
+        .map(|slice| {
+            let mut bands: Vec<Vec<i32>> = geom.bands.iter().map(|b| Vec::with_capacity(b.wpb as usize * b.l1 as usize * slice.len())).collect();
+            // Vertical GCLI prediction is signalled even at Nikon slice starts. Its external
+            // predecessor is zero; the second row of component 2 still predicts within the precinct.
+            let mut top = PrecinctTop::default();
+            for (ph, body) in slice {
+                let mut body = Reader { rest: body };
+                let mut state = PrecinctState::default();
+                for layout in &packets {
+                    let packet = entropy::parse_packet_header(body.rest, &geom).map_err(corrupt)?;
+                    body.take(packet.header_bytes)?;
+                    let decoded = entropy::decode_packet_body(body.rest, &geom, ph, &packet, layout, &mut state, Some(&top)).map_err(corrupt)?;
+                    body.take(decoded.bytes_consumed)?;
+                }
+                // Lprc includes encoder padding (not necessarily zero), which is not another packet.
+                let dequantized =
+                    oxideav_jpegxs::dequant::dequantize_precinct(1, &geom, &entropy::precinct_truncation(&geom, ph), &state.coefficients, 4);
+                for (dst, src) in bands.iter_mut().zip(dequantized) {
+                    dst.extend(src);
+                }
+                top = PrecinctTop::capture(&geom, ph, &state);
+            }
+            Ok(bands)
+        })
+        .collect::<Result<_>>()?;
+    let mut gathered: Vec<Vec<i32>> = geom.bands.iter().map(|b| Vec::with_capacity(b.wpb as usize * b.l1 as usize * (h / 2))).collect();
+    for slice in slices {
+        for (dst, src) in gathered.iter_mut().zip(slice) {
+            dst.extend(src);
+        }
+    }
     let map = band_map();
-    for (c, plane) in planes.iter_mut().enumerate() {
+    let mut component_bands: Vec<Vec<Vec<i32>>> = Vec::with_capacity(4);
+    for c in 0..4 {
         let mut bands = vec![Vec::new(); if c == 2 { 1 } else { 8 }];
         for ((cc, b), source) in map.iter().zip(&mut gathered) {
             if *cc == c {
@@ -235,31 +255,111 @@ pub(super) fn decode(bytes: &[u8], width: usize, height: usize, bits: u32) -> Re
                 *dest = std::mem::take(source);
             }
         }
-        *plane = if c == 2 { std::mem::take(&mut bands[0]) } else { inverse_wavelet(&bands, w, h)? };
-        // Br=4 bounds dequantized coefficients to <2^19; six 5/3 passes fit i32. Keep the
-        // following four-component colour transform's neighbour sums well inside i32 as well.
-        if plane.len() != count / 4 || plane.iter().any(|&v| !(-(1 << 24)..=1 << 24).contains(&v)) {
-            return Err(corrupt("reconstructed component is out of range"));
-        }
-        plane.reverse();
+        component_bands.push(bands);
     }
+    let planes: Vec<Vec<i32>> = component_bands
+        .into_par_iter()
+        .enumerate()
+        .map(|(c, mut bands)| {
+            let mut plane = if c == 2 { std::mem::take(&mut bands[0]) } else { inverse_wavelet(&bands, w, h)? };
+            // Br=4 bounds dequantized coefficients to <2^19; six 5/3 passes fit i32. Keep the
+            // following four-component colour transform's neighbour sums well inside i32 as well.
+            if plane.len() != count / 4 || plane.iter().any(|&v| !(-(1 << 24)..=1 << 24).contains(&v)) {
+                return Err(corrupt("reconstructed component is out of range"));
+            }
+            plane.reverse();
+            Ok(plane)
+        })
+        .collect::<Result<_>>()?;
+    let Ok(mut planes) = <[Vec<i32>; 4]>::try_from(planes) else { return Err(corrupt("missing component")) };
     // Nikon's superpixel origin is opposite to the standard transform's origin. Reverse both
     // axes (the contiguous plane), order Ya/Cb/Cr/Delta, then undo the reversal on its outputs.
     planes.swap(2, 3);
-    let mut slices: Vec<_> = planes.iter_mut().map(Vec::as_mut_slice).collect();
-    oxideav_jpegxs::colour_transform::inverse_star_tetrix(&mut slices, w, h, 0, 0, 0, 0).map_err(corrupt)?;
+    let mut planes = inverse_star_tetrix(planes, w, h);
     for plane in &mut planes {
         plane.reverse();
     }
     let mut out = vec![0; count];
-    for (y, row) in out.chunks_exact_mut(width).enumerate() {
+    out.par_chunks_exact_mut(width).enumerate().try_for_each(|(y, row)| {
         for (x, value) in row.iter_mut().enumerate() {
             let c = 3 - (y % 2 * 2 + x % 2);
             let sample = planes[c].get((y / 2) * w + x / 2).ok_or_else(|| corrupt("incomplete reconstructed plane"))?;
             *value = header.transfer.apply(*sample);
         }
-    }
+        Ok::<_, RawError>(())
+    })?;
     Ok((out, header.transfer.black))
+}
+
+/// The inverse Star-Tetrix colour transform of JPEG XS (ISO/IEC 21122-1 Annex F) with `Ct = 0`, `Cf = 0` and
+/// `e1 = e2 = 0`, which Nikon writes: `[Ya, Cb, Cr, Δ]` half-resolution planes in, `[R, G1, G2, B]` out. The four
+/// lifting steps each read only the previous step's planes, so every step's rows are computed in parallel.
+fn inverse_star_tetrix([ya, cb, cr, delta]: [Vec<i32>; 4], w: usize, h: usize) -> [Vec<i32>; 4] {
+    use rayon::prelude::*;
+    // One lifting step: `out[x, y] = base[x, y] + f(x, y)` over the whole plane.
+    let step = |base: &[i32], f: &(dyn Fn(usize, usize) -> i32 + Sync)| -> Vec<i32> {
+        let mut out = vec![0; w * h];
+        if w > 0 {
+            out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                for (x, v) in row.iter_mut().enumerate() {
+                    *v = base.get(y * w + x).copied().unwrap_or(0) + f(x, y);
+                }
+            });
+        }
+        out
+    };
+    let o = [&ya[..], &cb[..], &cr[..], &delta[..]];
+    // inverse average: Ya from the four diagonal Δ neighbours
+    let w1_0 = step(&ya, &|x, y| -floor_div(diagonal(&o, w, h, 0, x, y), 8));
+    let w1 = [&w1_0[..], &cb[..], &cr[..], &delta[..]];
+    // inverse delta: Δ from the four diagonal luma neighbours
+    let w2_3 = step(&delta, &|x, y| floor_div(diagonal(&w1, w, h, 3, x, y), 4));
+    let w2 = [&w1_0[..], &cb[..], &cr[..], &w2_3[..]];
+    // inverse Y: both greens from their four chroma neighbours
+    let w3_0 = step(&w1_0, &|x, y| -floor_div(cross(&w2, w, h, 0, x, y), 8));
+    let w3_3 = step(&w2_3, &|x, y| -floor_div(cross(&w2, w, h, 3, x, y), 8));
+    let w3 = [&w3_0[..], &cb[..], &cr[..], &w3_3[..]];
+    // inverse CbCr: blue and red from their four green neighbours
+    let w4_1 = step(&cb, &|x, y| floor_div(cross(&w3, w, h, 1, x, y), 4));
+    let w4_2 = step(&cr, &|x, y| floor_div(cross(&w3, w, h, 2, x, y), 4));
+    [w4_2, w3_3, w3_0, w4_1]
+}
+
+/// Sum of the four diagonal neighbours of component `c`'s sample `(x, y)`.
+fn diagonal(planes: &[&[i32]; 4], w: usize, h: usize, c: usize, x: usize, y: usize) -> i32 {
+    [(-1, -1), (1, -1), (-1, 1), (1, 1)].iter().map(|&(rx, ry)| neighbour(planes, w, h, c, x, y, rx, ry)).sum()
+}
+
+/// Sum of the four horizontal and vertical neighbours of component `c`'s sample `(x, y)`.
+fn cross(planes: &[&[i32]; 4], w: usize, h: usize, c: usize, x: usize, y: usize) -> i32 {
+    [(-1, 0), (1, 0), (0, -1), (0, 1)].iter().map(|&(rx, ry)| neighbour(planes, w, h, c, x, y, rx, ry)).sum()
+}
+
+/// The sample at offset `(rx, ry)` on the full-resolution CFA grid from component `c`'s sample `(x, y)`, mirrored at
+/// the image edges (Table F.12): component `c` sits at offset `(δx, δy)` of each 2×2 cell (Table F.10, `Ct = 0`),
+/// and the parity of the offset reached names the component read.
+#[allow(clippy::too_many_arguments)]
+fn neighbour(planes: &[&[i32]; 4], w: usize, h: usize, c: usize, x: usize, y: usize, rx: i32, ry: i32) -> i32 {
+    const DISPLACEMENT: [(i32, i32); 4] = [(0, 1), (1, 1), (0, 0), (1, 0)];
+    let (dx, dy) = DISPLACEMENT[c & 3];
+    let (gx, gy) = (2 * x as i64, 2 * y as i64);
+    let fx = |rx: i32| gx + i64::from(rx + dx);
+    let fy = |ry: i32| gy + i64::from(ry + dy);
+    let rx = if fx(rx) < 0 || fx(rx) >= 2 * w as i64 { -rx } else { rx };
+    let ry = if fy(ry) < 0 || fy(ry) >= 2 * h as i64 { -ry } else { ry };
+    let component = match ((rx + dx).rem_euclid(2), (ry + dy).rem_euclid(2)) {
+        (0, 1) => 0,
+        (1, 1) => 1,
+        (0, 0) => 2,
+        _ => 3,
+    };
+    let (xo, yo) = (fx(rx).max(0) as usize / 2, fy(ry).max(0) as usize / 2);
+    planes[component].get(yo * w + xo).copied().unwrap_or(0)
+}
+
+/// `⌊n / d⌋` for `d > 0`.
+fn floor_div(n: i32, d: i32) -> i32 {
+    n.div_euclid(d)
 }
 
 fn band_row(bands: &[Vec<i32>], band: usize, y: usize, width: usize) -> Result<&[i32]> {
@@ -402,6 +502,23 @@ pub(super) mod tests {
             for x in 0..w {
                 assert_eq!(samples[y * w + x], [1114, 1097, 1092, 1081][2 * (y % 2) + x % 2]);
             }
+        }
+    }
+
+    #[test]
+    fn the_parallel_star_tetrix_matches_the_reference_transform() {
+        // odd and even sizes, down to one sample: every edge case of the mirrored access
+        for (w, h) in [(1, 1), (2, 1), (1, 3), (5, 4), (8, 7), (35, 6)] {
+            let mut seed = (w * 31 + h) as u64;
+            let mut next = || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((seed >> 33) as i32 % (1 << 20)) - (1 << 19)
+            };
+            let planes: [Vec<i32>; 4] = std::array::from_fn(|_| (0..w * h).map(|_| next()).collect());
+            let mut reference = planes.clone();
+            let mut slices: Vec<&mut [i32]> = reference.iter_mut().map(Vec::as_mut_slice).collect();
+            oxideav_jpegxs::colour_transform::inverse_star_tetrix(&mut slices, w, h, 0, 0, 0, 0).unwrap();
+            assert_eq!(inverse_star_tetrix(planes, w, h), reference, "{w}x{h}");
         }
     }
 
