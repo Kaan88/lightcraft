@@ -41,6 +41,7 @@ cargo run --release -p lcc-engine --example perf_tile -- $PWD/corpus/raw/arw-son
 cargo xtask bench-catalog --photos 100000,1000000 [--backend v4]
 cargo xtask bench-keywords [--listed 2000] [--photos 20000]                                             # Keywording panel
 cargo test --release -p lcc-ui-egui map_50k -- --ignored --nocapture                                   # Map, 50k pins
+python tools/perf/appperf.py ab --builds A B --probe drag --files RAW...                         # the app, A/B (tools/perf)
 ```
 
 Import / previews / publish / print: 1,000 unique raws are made as reflink copies of the 24 MP ARW with a few bytes
@@ -179,6 +180,29 @@ the cores, 1..=4) at once, results in order. Single-photo rows only vary with ma
 batches of `render_width()` photos concurrently and writes them in order on the worker: **157 s** (3.3×). A render
 Idle, 2026-10-11: **102.6 s** (102.1 / 102.6 / 103.3 s), ~0.1 s per photo. A render
 thread that dies is reported as that photo's failure, and cancel is checked before each batch and each upload.
+
+## Interactive editing (`tools/perf/appperf.py`)
+
+Measured 2026-10-24/25 on an i7-14700KF (28 threads), 32 GB, RTX 4070 Ti SUPER (DX12), Windows 11, HDR display
+(3.4× headroom). Each "after" is a back-to-back A/B in the same session (`appperf.py ab`), the app window 1600 × 1000,
+three to eight corpus raws (24–61 MP), medians. Before = the branch point of this work.
+
+| What | Before | After | Change |
+|---|---|---|---|
+| Fit drag, HQ previews on, SDR: renders shown per second | 23.4 | 58.1 (HQ off 60.7) | GPU display fit, byte-level CPU fit |
+| Fit drag, HQ on, SDR: render per update | 40.6 ms | 4.9 ms | display fit on the GPU |
+| One isolated update, HQ on, SDR | 77 ms | ~42 ms (half at ~35 ms, the HQ-off time) | in-frame wait for a full-quality update |
+| HDR edit with HDR Preview off, HQ drag | 30.9 upd/s | 49.5 upd/s | HDR histogram from the view's stage cache |
+| HDR shown in HDR: drag completions per second | 160 | 199 (slowest UI frame 13–14 → 9 ms) | HDR textures made on the GPU |
+| Next photo after a 1.5 s look | 85 ms (max 343) | 33 ms (max 51) | the loupe adopts the neighbour's prefetched render |
+| Letting go of a drag at 1:1: on screen sharp | 0.2–4.9 s (tiles) | ~71 ms | one full-quality window stands in for the tiles |
+| Preview files written per HQ drag | 119 | 2 | view renders reach the disk cache as a debounced series |
+| First 1:1 zoom after a 2.5 s look, until every tile | 2.23 s (max 6.8) | 1.46 s (max 4.3) | the full-size source decoded during the look |
+
+Raw decode (release, `ONLY=source render_bench`), each bit-identical before and after on all 197 corpus raws:
+compressed Samsung SRW 1434 → 406 ms (NX500), a 50 MP single-strip phone DNG 1137 → 66 ms (its preview 1.6 → 0.4 s),
+Nikon Z f HE 1009 → 127 ms. Canon CRW (G6, 351 ms) is left: its Huffman stream is serial by format, and the rest is
+the white-balance estimate from the camera JPEG.
 
 ## Upstream-PR candidates (shared code, not changed here)
 
