@@ -595,12 +595,29 @@ pub fn apply_list(list: &[Opcode], buf: &mut [f32], w: usize, h: usize, cpp: usi
                 }
             }
             Opcode::GainMap { area, points_v, points_h, spacing, origin, map_planes, gains } => {
-                for (x, y, p) in area_iter(area, w, h, cpp) {
-                    let rv = y as f64 / h as f64;
-                    let rh = x as f64 / w as f64;
-                    let g = gain_at(*points_v, *points_h, *spacing, *origin, *map_planes, gains, rv, rh, p - area.plane as usize);
-                    buf[(y * w + x) * cpp + p] *= g;
+                // the rows of `area_iter`, each on its own (a phone's DNG carries four over 50 MP)
+                use rayon::prelude::*;
+                let (t, l) = (area.top as usize, area.left as usize);
+                let (b, r) = ((area.bottom as usize).min(h), (area.right as usize).min(w));
+                let (p0, p1) = (area.plane as usize, (area.plane as usize + area.planes.max(1) as usize).min(cpp));
+                let (row_pitch, col_pitch) = (area.row_pitch.max(1) as usize, area.col_pitch.max(1) as usize);
+                if w * cpp == 0 {
+                    continue;
                 }
+                buf.par_chunks_mut(w * cpp).enumerate().filter(|&(y, _)| (t..b).contains(&y) && (y - t).is_multiple_of(row_pitch)).for_each(
+                    |(y, row)| {
+                        let rv = y as f64 / h as f64;
+                        for x in (l..r.max(l)).step_by(col_pitch) {
+                            let rh = x as f64 / w as f64;
+                            for p in p0..p1.max(p0) {
+                                let g = gain_at(*points_v, *points_h, *spacing, *origin, *map_planes, gains, rv, rh, p - area.plane as usize);
+                                if let Some(v) = row.get_mut(x * cpp + p) {
+                                    *v *= g;
+                                }
+                            }
+                        }
+                    },
+                );
             }
             Opcode::DeltaPerRow { area, deltas } | Opcode::DeltaPerColumn { area, deltas } => {
                 let per_row = matches!(op, Opcode::DeltaPerRow { .. });

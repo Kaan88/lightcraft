@@ -668,69 +668,129 @@ pub fn decode(d: &[u8], max_samples: usize) -> Result<Frame, RawError> {
         .map(|&t| h.tables.get(t).and_then(Option::as_ref).ok_or_else(|| err("scan uses an undefined Huffman table")))
         .collect::<Result<_, RawError>>()?;
     let mut out = vec![0u16; total];
-    let mut br = BitReader::new(entropy);
-    let init = 1i32 << (h.precision - h.pt - 1);
-    let mask = 0xffffi32;
+    let scan = Scan { width: w, components: nc, restart: h.restart, init: 1i32 << (h.precision - h.pt - 1), predictor: h.predictor, tables: &tables };
     let row_len = w * nc;
-    let pred = h.predictor;
-    let mut restart_left = h.restart;
-    let mut first_line = true; // first line of image or restart interval
-    let mut reset_pending = true;
-    for y in 0..ht {
-        let (prev_rows, cur_rows) = out.split_at_mut(y * row_len);
-        let cur = &mut cur_rows[..row_len];
-        let prev = if y > 0 { &prev_rows[(y - 1) * row_len..] } else { &[][..] };
-        for x in 0..w {
-            if h.restart > 0 {
-                if restart_left == 0 {
-                    if !br.restart() {
-                        return Err(err("missing restart marker"));
-                    }
-                    restart_left = h.restart;
-                    first_line = true;
-                    reset_pending = true;
-                }
-                restart_left -= 1;
-            }
-            for c in 0..nc {
-                let i = x * nc + c;
-                let p = if reset_pending {
-                    init
-                } else if first_line {
-                    if x == 0 { prev.get(i).map_or(init, |&v| v as i32) } else { cur[i - nc] as i32 }
-                } else if x == 0 || pred == 0 {
-                    if pred == 0 { 0 } else { prev[i] as i32 }
-                } else {
-                    let ra = cur[i - nc] as i32;
-                    let rb = prev[i] as i32;
-                    let rc = prev[i - nc] as i32;
-                    match pred {
-                        1 => ra,
-                        2 => rb,
-                        3 => rc,
-                        4 => ra + rb - rc,
-                        5 => ra + ((rb - rc) >> 1),
-                        6 => rb + ((ra - rc) >> 1),
-                        _ => (ra + rb) >> 1,
-                    }
-                };
-                let ssss = tables[c].decode(&mut br)?;
-                let diff = diff_value(&mut br, ssss);
-                cur[i] = ((p + diff) & mask) as u16;
-            }
-            reset_pending = false;
+    // A restart interval of whole rows makes each interval an independent run of rows (it starts from the reset
+    // predictor and reads only its own rows): those are decoded in parallel, with the same arithmetic. Anything else,
+    // or a stream with fewer markers than intervals, is decoded in one pass (which reports the missing marker).
+    let rows_per = if h.restart > 0 && h.restart.is_multiple_of(w) { h.restart / w } else { 0 };
+    let segments = if rows_per > 0 && ht > rows_per { restart_segments(entropy, ht.div_ceil(rows_per)) } else { None };
+    match segments {
+        Some(segments) => {
+            use rayon::prelude::*;
+            // (enough rows per task that a small tile isn't split into tiny jobs)
+            let min_len = (1usize << 16).div_ceil(rows_per * row_len).max(1);
+            out.par_chunks_mut(rows_per * row_len)
+                .zip(segments.par_iter())
+                .with_min_len(min_len)
+                .try_for_each(|(rows, seg)| scan.decode(&mut BitReader::new(seg), rows))?;
         }
-        first_line = false;
-        if br.overrun > 64 * 8 {
-            return Err(err("entropy data exhausted"));
-        }
+        None => scan.decode(&mut BitReader::new(entropy), &mut out)?,
     }
     if h.pt > 0 {
         for v in &mut out {
             *v <<= h.pt;
         }
     }
-    Ok(Frame { width: w, height: ht, components: nc, precision: h.precision, predictor: pred, point_transform: h.pt, data: out })
+    Ok(Frame { width: w, height: ht, components: nc, precision: h.precision, predictor: h.predictor, point_transform: h.pt, data: out })
+}
+
+/// One scan's decoding parameters (see [`decode`]).
+struct Scan<'t> {
+    width: usize,
+    components: usize,
+    restart: usize,
+    init: i32,
+    predictor: u8,
+    tables: &'t [&'t Huffman],
+}
+
+impl Scan<'_> {
+    /// Decode `out.len() / (width × components)` rows from `br`, which starts at the scan or just after a restart
+    /// marker.
+    fn decode(&self, br: &mut BitReader, out: &mut [u16]) -> Result<(), RawError> {
+        let (w, nc, pred, init, tables) = (self.width, self.components, self.predictor, self.init, self.tables);
+        let mask = 0xffffi32;
+        let row_len = w * nc;
+        let mut restart_left = self.restart;
+        let mut first_line = true; // first line of image or restart interval
+        let mut reset_pending = true;
+        for y in 0..out.len() / row_len {
+            let (prev_rows, cur_rows) = out.split_at_mut(y * row_len);
+            let cur = &mut cur_rows[..row_len];
+            let prev = if y > 0 { &prev_rows[(y - 1) * row_len..] } else { &[][..] };
+            for x in 0..w {
+                if self.restart > 0 {
+                    if restart_left == 0 {
+                        if !br.restart() {
+                            return Err(err("missing restart marker"));
+                        }
+                        restart_left = self.restart;
+                        first_line = true;
+                        reset_pending = true;
+                    }
+                    restart_left -= 1;
+                }
+                for c in 0..nc {
+                    let i = x * nc + c;
+                    let p = if reset_pending {
+                        init
+                    } else if first_line {
+                        if x == 0 { prev.get(i).map_or(init, |&v| v as i32) } else { cur[i - nc] as i32 }
+                    } else if x == 0 || pred == 0 {
+                        if pred == 0 { 0 } else { prev[i] as i32 }
+                    } else {
+                        let ra = cur[i - nc] as i32;
+                        let rb = prev[i] as i32;
+                        let rc = prev[i - nc] as i32;
+                        match pred {
+                            1 => ra,
+                            2 => rb,
+                            3 => rc,
+                            4 => ra + rb - rc,
+                            5 => ra + ((rb - rc) >> 1),
+                            6 => rb + ((ra - rc) >> 1),
+                            _ => (ra + rb) >> 1,
+                        }
+                    };
+                    let ssss = tables[c].decode(br)?;
+                    let diff = diff_value(br, ssss);
+                    cur[i] = ((p + diff) & mask) as u16;
+                }
+                reset_pending = false;
+            }
+            first_line = false;
+            if br.overrun > 64 * 8 {
+                return Err(err("entropy data exhausted"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The entropy data of each of `n` restart intervals: split just after each `RSTn` marker (`FF D0`–`FF D7`, which
+/// stuffed entropy bytes can't form), each ending at its marker. `None` when there are fewer than `n − 1` markers.
+fn restart_segments(entropy: &[u8], n: usize) -> Option<Vec<&[u8]>> {
+    use rayon::prelude::*;
+    const PIECE: usize = 1 << 20;
+    let marker = |i: usize| entropy.get(i) == Some(&0xff) && entropy.get(i + 1).is_some_and(|b| (0xd0..=0xd7).contains(b));
+    let starts: Vec<usize> = (0..entropy.len().div_ceil(PIECE))
+        .into_par_iter()
+        .flat_map_iter(|k| (k * PIECE..((k + 1) * PIECE).min(entropy.len())).filter(move |&i| marker(i)))
+        .collect();
+    if starts.len() + 1 < n {
+        return None;
+    }
+    let mut segments = Vec::with_capacity(n);
+    let mut from = 0;
+    for &m in starts.iter().take(n - 1) {
+        // (fill bytes before the marker are left out: an `FF` at a segment's end would read as stuffing)
+        let end = entropy.get(from..m)?.iter().rposition(|&b| b != 0xff).map_or(from, |i| from + i + 1);
+        segments.push(entropy.get(from..end)?);
+        from = m + 2;
+    }
+    segments.push(entropy.get(from..)?);
+    Some(segments)
 }
 
 // ------------------------------------------------------------------------------------------------ encoder
@@ -1129,6 +1189,38 @@ pub(crate) mod tests {
         for rst in [1usize, 7, 20, 40] {
             let enc = encode(&data, 20, 9, 2, 12, 6, rst);
             assert_eq!(decode(&enc, usize::MAX).unwrap().data, data, "restart {rst}");
+        }
+    }
+
+    #[test]
+    fn row_aligned_restarts_decode_in_parallel_as_in_one_pass() {
+        // a restart every row (a phone's single-strip DNG) or every few rows: each interval is decoded on its own
+        let (w, h) = (64, 300);
+        let data = noise(w * h * 3, 14, 9);
+        for (pred, rst) in [(1u8, w), (6, 3 * w), (4, 7 * w)] {
+            let enc = encode(&data, w, h, 3, 14, pred, rst);
+            assert_eq!(decode(&enc, usize::MAX).unwrap().data, data, "predictor {pred} restart {rst}");
+            // fill bytes before each marker are allowed (T.81 B.1.1.2) and change nothing
+            let mut filled = Vec::with_capacity(enc.len() + h);
+            for (i, &b) in enc.iter().enumerate() {
+                if b == 0xff && enc.get(i + 1).is_some_and(|n| (0xd0..=0xd7).contains(n)) {
+                    filled.extend_from_slice(&[0xff, 0xff]);
+                }
+                filled.push(b);
+            }
+            assert_eq!(decode(&filled, usize::MAX).unwrap().data, data, "fill bytes, restart {rst}");
+            // a stream that lost its markers is an error, not a panic or a partial image
+            let mut stripped = Vec::with_capacity(enc.len());
+            let mut i = 0;
+            while i < enc.len() {
+                if enc[i] == 0xff && enc.get(i + 1).is_some_and(|n| (0xd0..=0xd7).contains(n)) {
+                    i += 2;
+                    continue;
+                }
+                stripped.push(enc[i]);
+                i += 1;
+            }
+            assert!(decode(&stripped, usize::MAX).is_err(), "no markers, restart {rst}");
         }
     }
 

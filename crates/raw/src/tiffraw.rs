@@ -109,8 +109,19 @@ pub fn read_image(data: &[u8], info: &ImageInfo, order: ByteOrder, packing: Pack
     let chunks = info.chunks(data.len() as u64);
     let planar = info.planar == 2 && cpp > 1;
     let ccpp = if planar { 1 } else { cpp };
-    let decoded: Vec<Result<(Chunk, ChunkPx)>> =
+    let mut decoded: Vec<Result<(Chunk, ChunkPx)>> =
         chunks.par_iter().map(|c| decode_chunk(data, info, c, order, packing, ccpp, bits, float).map(|p| (*c, p))).collect();
+    // one chunk that is the whole image (a phone's single-strip DNG) is the image
+    if let [Ok((c, _))] = decoded.as_slice()
+        && (c.x, c.y, c.width as usize, c.height as usize, planar) == (0, 0, w, h, false)
+    {
+        match decoded.into_iter().next() {
+            Some(Ok((_, ChunkPx::U16(v)))) if !float && v.len() == total => return Ok(RawData::U16(v)),
+            Some(Ok((_, ChunkPx::F32(v)))) if float && v.len() == total => return Ok(RawData::F32(v)),
+            Some(Ok((c, px))) => decoded = vec![Ok((c, px))],
+            _ => decoded = Vec::new(),
+        }
+    }
     let mut out_u16 = if float { Vec::new() } else { vec![0u16; total] };
     let mut out_f32 = if float { vec![0f32; total] } else { Vec::new() };
     for r in decoded {
@@ -121,34 +132,53 @@ pub fn read_image(data: &[u8], info: &ImageInfo, order: ByteOrder, packing: Pack
         if x0 >= w || y0 >= h {
             continue;
         }
-        let copy_w = cw.min(w - x0);
-        let copy_h = ch.min(h - y0);
-        for y in 0..copy_h {
-            for x in 0..copy_w {
-                for s in 0..ccpp {
-                    let src = (y * cw + x) * ccpp + s;
-                    let dst_s = if planar { c.plane as usize } else { s };
-                    if dst_s >= cpp {
-                        continue;
-                    }
-                    let dst = ((y0 + y) * w + x0 + x) * cpp + dst_s;
-                    match &px {
-                        ChunkPx::U16(v) => {
-                            if let (Some(o), Some(&s)) = (out_u16.get_mut(dst), v.get(src)) {
-                                *o = s;
-                            }
-                        }
-                        ChunkPx::F32(v) => {
-                            if let (Some(o), Some(&s)) = (out_f32.get_mut(dst), v.get(src)) {
-                                *o = s;
-                            }
-                        }
-                    }
-                }
-            }
+        let at = Place { w, cpp, cw, ccpp, x0, y0, copy_w: cw.min(w - x0), copy_h: ch.min(h - y0), plane: planar.then_some(c.plane as usize) };
+        match &px {
+            ChunkPx::U16(v) => at.copy(v, &mut out_u16),
+            ChunkPx::F32(v) => at.copy(v, &mut out_f32),
         }
     }
     Ok(if float { RawData::F32(out_f32) } else { RawData::U16(out_u16) })
+}
+
+/// Where a decoded chunk's samples go in the image (see [`read_image`]).
+struct Place {
+    w: usize,
+    cpp: usize,
+    cw: usize,
+    ccpp: usize,
+    x0: usize,
+    y0: usize,
+    copy_w: usize,
+    copy_h: usize,
+    /// The plane of a planar chunk (one sample per pixel).
+    plane: Option<usize>,
+}
+
+impl Place {
+    fn copy<T: Copy>(&self, v: &[T], out: &mut [T]) {
+        for y in 0..self.copy_h {
+            let src = y * self.cw * self.ccpp;
+            let dst = ((self.y0 + y) * self.w + self.x0) * self.cpp;
+            match self.plane {
+                // interleaved: the row's samples in one copy, as far as the chunk has them
+                None => {
+                    let src = v.get(src..).unwrap_or_default();
+                    let dst = out.get_mut(dst..).unwrap_or_default();
+                    let n = (self.copy_w * self.ccpp).min(src.len()).min(dst.len());
+                    dst[..n].copy_from_slice(&src[..n]);
+                }
+                Some(p) if p < self.cpp => {
+                    for x in 0..self.copy_w {
+                        if let (Some(o), Some(&s)) = (out.get_mut(dst + x * self.cpp + p), v.get(src + x)) {
+                            *o = s;
+                        }
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
